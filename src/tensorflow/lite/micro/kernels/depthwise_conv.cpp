@@ -25,6 +25,7 @@ limitations under the License.
 #include "tensorflow/lite/kernels/kernel_util.h"
 #include "tensorflow/lite/kernels/padding.h"
 #include "tensorflow/lite/micro/kernels/kernel_util.h"
+#include "esp_nn.h"
 
 namespace tflite {
 namespace {
@@ -68,17 +69,46 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
       break;
     }
     case kTfLiteInt8: {
-      reference_integer_ops::DepthwiseConvPerChannel(
-          DepthwiseConvParamsQuantized(params, data),
-          data.per_channel_output_multiplier, data.per_channel_output_shift,
-          tflite::micro::GetTensorShape(input),
-          tflite::micro::GetTensorData<int8_t>(input),
-          tflite::micro::GetTensorShape(filter),
-          tflite::micro::GetTensorData<int8_t>(filter),
-          tflite::micro::GetTensorShape(bias),
-          tflite::micro::GetOptionalTensorData<int32_t>(bias),
-          tflite::micro::GetTensorShape(output),
-          tflite::micro::GetTensorData<int8_t>(output));
+      const auto& input_shape = tflite::micro::GetTensorShape(input);
+      const auto& filter_shape = tflite::micro::GetTensorShape(filter);
+      const auto& output_shape = tflite::micro::GetTensorShape(output);
+      const auto dw_params = DepthwiseConvParamsQuantized(params, data);
+
+      data_dims_t input_dims = {input_shape.Dims(2), input_shape.Dims(1),
+                                input_shape.Dims(3), 0};
+      data_dims_t filter_dims = {filter_shape.Dims(2), filter_shape.Dims(1),
+                                 filter_shape.Dims(3), 0};
+      data_dims_t output_dims = {output_shape.Dims(2), output_shape.Dims(1),
+                                 output_shape.Dims(3), 0};
+      dw_conv_params_t esp_dw_params = {};
+      esp_dw_params.in_offset = dw_params.input_offset;
+      esp_dw_params.out_offset = dw_params.output_offset;
+      esp_dw_params.ch_mult = dw_params.depth_multiplier;
+      esp_dw_params.stride = {dw_params.stride_width, dw_params.stride_height};
+      esp_dw_params.padding = {dw_params.padding_values.width,
+                               dw_params.padding_values.height};
+      esp_dw_params.dilation = {dw_params.dilation_width_factor,
+                                dw_params.dilation_height_factor};
+      esp_dw_params.activation = {dw_params.quantized_activation_min,
+                                  dw_params.quantized_activation_max};
+      quant_data_t quant = {data.per_channel_output_shift,
+                            data.per_channel_output_multiplier};
+
+      int scratch_size = esp_nn_get_depthwise_conv_scratch_size(
+          &input_dims, &filter_dims, &output_dims, &esp_dw_params);
+      if (scratch_size > 0) {
+        void* scratch = __builtin_alloca(scratch_size);
+        esp_nn_set_depthwise_conv_scratch_buf(scratch);
+      }
+
+      esp_nn_depthwise_conv_s8(&input_dims,
+                               tflite::micro::GetTensorData<int8_t>(input),
+                               &filter_dims,
+                               tflite::micro::GetTensorData<int8_t>(filter),
+                               tflite::micro::GetOptionalTensorData<int32_t>(bias),
+                               &output_dims,
+                               tflite::micro::GetTensorData<int8_t>(output),
+                               &esp_dw_params, &quant);
       break;
     }
     default:

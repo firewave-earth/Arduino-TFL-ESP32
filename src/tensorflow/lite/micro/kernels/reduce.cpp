@@ -93,6 +93,8 @@ TfLiteStatus PrepareMax(TfLiteContext* context, TfLiteNode* node) {
 
   op_data->input_scale = input->params.scale;
   op_data->output_scale = output->params.scale;
+  op_data->input_zp = input->params.zero_point;
+  op_data->output_zp = output->params.zero_point;
   op_data->num_output_elements = NumElements(output);
 
   context->RequestScratchBufferInArena(context, sizeof(int) * input->dims->size,

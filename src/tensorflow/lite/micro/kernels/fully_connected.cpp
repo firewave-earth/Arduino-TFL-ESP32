@@ -24,6 +24,7 @@ limitations under the License.
 #include "tensorflow/lite/kernels/internal/tensor_ctypes.h"
 #include "tensorflow/lite/kernels/kernel_util.h"
 #include "tensorflow/lite/micro/kernels/kernel_util.h"
+#include "esp_nn.h"
 
 namespace tflite {
 namespace {
@@ -107,19 +108,29 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
     }
 
     case kTfLiteInt8: {
+      const auto& filter_shape = tflite::micro::GetTensorShape(filter);
+      const auto fc_params = FullyConnectedParamsQuantized(data);
+
       const int32_t* bias_data =
           nullptr != bias ? tflite::micro::GetTensorData<int32_t>(bias)
                           : nullptr;
+      int out_channels = filter_shape.Dims(0);
+      int row_len = filter_shape.FlatSize() / out_channels;
 
-      tflite::reference_integer_ops::FullyConnected(
-          FullyConnectedParamsQuantized(data),
-          tflite::micro::GetTensorShape(input),
+      esp_nn_fully_connected_s8(
           tflite::micro::GetTensorData<int8_t>(input),
-          tflite::micro::GetTensorShape(filter),
+          fc_params.input_offset,
+          row_len,
           tflite::micro::GetTensorData<int8_t>(filter),
-          tflite::micro::GetTensorShape(bias), bias_data,
-          tflite::micro::GetTensorShape(output),
-          tflite::micro::GetTensorData<int8_t>(output));
+          fc_params.weights_offset,
+          bias_data,
+          tflite::micro::GetTensorData<int8_t>(output),
+          out_channels,
+          fc_params.output_offset,
+          fc_params.output_shift,
+          fc_params.output_multiplier,
+          fc_params.quantized_activation_min,
+          fc_params.quantized_activation_max);
       break;
     }
 
