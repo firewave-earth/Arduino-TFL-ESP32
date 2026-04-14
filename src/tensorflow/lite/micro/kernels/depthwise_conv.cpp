@@ -26,6 +26,7 @@ limitations under the License.
 #include "tensorflow/lite/kernels/padding.h"
 #include "tensorflow/lite/micro/kernels/kernel_util.h"
 #include "esp_nn.h"
+#include <esp_heap_caps.h>
 
 namespace tflite {
 namespace {
@@ -96,9 +97,10 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
 
       int scratch_size = esp_nn_get_depthwise_conv_scratch_size(
           &input_dims, &filter_dims, &output_dims, &esp_dw_params);
+      void* scratch = nullptr;
       if (scratch_size > 0) {
-        void* scratch = __builtin_alloca(scratch_size);
-        esp_nn_set_depthwise_conv_scratch_buf(scratch);
+        scratch = heap_caps_malloc(scratch_size, MALLOC_CAP_INTERNAL);
+        if (scratch) esp_nn_set_depthwise_conv_scratch_buf(scratch);
       }
 
       esp_nn_depthwise_conv_s8(&input_dims,
@@ -109,6 +111,7 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
                                &output_dims,
                                tflite::micro::GetTensorData<int8_t>(output),
                                &esp_dw_params, &quant);
+      if (scratch) heap_caps_free(scratch);
       break;
     }
     default:
