@@ -99,7 +99,8 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
           &input_dims, &filter_dims, &output_dims, &esp_dw_params);
       void* scratch = nullptr;
       if (scratch_size > 0) {
-        scratch = heap_caps_malloc(scratch_size, MALLOC_CAP_INTERNAL);
+        scratch = heap_caps_malloc(scratch_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!scratch) scratch = heap_caps_malloc(scratch_size, MALLOC_CAP_8BIT);
         if (scratch) esp_nn_set_depthwise_conv_scratch_buf(scratch);
       }
 
