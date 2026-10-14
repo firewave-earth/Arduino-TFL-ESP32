@@ -62,6 +62,41 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
                                  context, params->activation, input->type,
                                  input, filter, bias, output, data));
 
+  // The converter quantizes FULLY_CONNECTED weights per channel by default.
+  // The single multiplier above uses only channel 0's scale, so per-channel
+  // weights need one multiplier per output channel.
+  data->per_channel_output_multiplier = nullptr;
+  data->per_channel_output_shift = nullptr;
+  const auto* affine_quantization =
+      static_cast<const TfLiteAffineQuantization*>(filter->quantization.params);
+  if (filter->quantization.type == kTfLiteAffineQuantization &&
+      affine_quantization != nullptr && affine_quantization->scale != nullptr &&
+      affine_quantization->scale->size > 1) {
+    if (input->type != kTfLiteInt8) {
+      TF_LITE_KERNEL_LOG(context,
+                         "Per-channel FULLY_CONNECTED weights are supported "
+                         "only for int8 input, not %s.",
+                         TfLiteTypeGetName(input->type));
+      return kTfLiteError;
+    }
+    TF_LITE_ENSURE_EQ(context, affine_quantization->quantized_dimension, 0);
+    const int out_channels = filter->dims->data[0];
+    data->per_channel_output_multiplier =
+        static_cast<int32_t*>(context->AllocatePersistentBuffer(
+            context, out_channels * sizeof(int32_t)));
+    data->per_channel_output_shift =
+        static_cast<int32_t*>(context->AllocatePersistentBuffer(
+            context, out_channels * sizeof(int32_t)));
+    TF_LITE_ENSURE(context, data->per_channel_output_multiplier != nullptr &&
+                                data->per_channel_output_shift != nullptr);
+    TF_LITE_ENSURE_STATUS(PopulateConvolutionQuantizationParams(
+        context, input, filter, bias, output, params->activation,
+        &data->output_multiplier, &data->output_shift,
+        &data->output_activation_min, &data->output_activation_max,
+        data->per_channel_output_multiplier, data->per_channel_output_shift,
+        out_channels));
+  }
+
   micro_context->DeallocateTempTfLiteTensor(input);
   micro_context->DeallocateTempTfLiteTensor(filter);
   if (bias != nullptr) {
@@ -116,6 +151,24 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
                           : nullptr;
       int out_channels = filter_shape.Dims(0);
       int row_len = filter_shape.FlatSize() / out_channels;
+
+      if (data.per_channel_output_multiplier != nullptr) {
+        esp_nn_fully_connected_per_ch_s8(
+            tflite::micro::GetTensorData<int8_t>(input),
+            fc_params.input_offset,
+            row_len,
+            tflite::micro::GetTensorData<int8_t>(filter),
+            fc_params.weights_offset,
+            bias_data,
+            tflite::micro::GetTensorData<int8_t>(output),
+            out_channels,
+            fc_params.output_offset,
+            data.per_channel_output_shift,
+            data.per_channel_output_multiplier,
+            fc_params.quantized_activation_min,
+            fc_params.quantized_activation_max);
+        break;
+      }
 
       esp_nn_fully_connected_s8(
           tflite::micro::GetTensorData<int8_t>(input),
