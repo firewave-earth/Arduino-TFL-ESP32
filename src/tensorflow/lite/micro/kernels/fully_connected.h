@@ -28,6 +28,10 @@ struct OpDataFullyConnected {
   // be represented as a fixed point multiplier plus a left shift.
   int32_t output_multiplier;
   int output_shift;
+  // One multiplier and shift per output channel when the weights are quantized
+  // per channel (one scale per output channel); null for per-tensor weights.
+  int32_t* per_channel_output_multiplier;
+  int32_t* per_channel_output_shift;
   // The range of the fused activation layer. For example for kNone and
   // uint8_t these would be 0 and 255.
   int32_t output_activation_min;
