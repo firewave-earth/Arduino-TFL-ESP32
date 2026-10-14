@@ -21,7 +21,6 @@ limitations under the License.
 #include "tensorflow/lite/kernels/padding.h"
 #include "tensorflow/lite/micro/kernels/kernel_util.h"
 #include "tensorflow/lite/micro/kernels/pooling.h"
-#include "esp_nn.h"
 
 namespace tflite {
 
@@ -160,31 +159,6 @@ void MaxPoolingEvalQuantized(TfLiteContext* context, TfLiteNode* node,
   op_params.padding_values.width = data->padding.width;
   op_params.quantized_activation_min = data->activation_min;
   op_params.quantized_activation_max = data->activation_max;
-
-  // esp-nn takes one batch at a time, and its S3 kernel needs a channel count
-  // that is a multiple of 4.
-  const RuntimeShape input_shape = tflite::micro::GetTensorShape(input);
-  const RuntimeShape output_shape = tflite::micro::GetTensorShape(output);
-  const int depth = MatchingDim(input_shape, 3, output_shape, 3);
-  if (depth % 4 == 0) {
-    const int batches = MatchingDim(input_shape, 0, output_shape, 0);
-    const int input_batch_size =
-        input_shape.Dims(1) * input_shape.Dims(2) * depth;
-    const int output_batch_size =
-        output_shape.Dims(1) * output_shape.Dims(2) * depth;
-    const int8_t* input_data = tflite::micro::GetTensorData<int8_t>(input);
-    int8_t* output_data = tflite::micro::GetTensorData<int8_t>(output);
-    for (int b = 0; b < batches; ++b) {
-      esp_nn_max_pool_s8(
-          input_data + b * input_batch_size, input_shape.Dims(2),
-          input_shape.Dims(1), output_data + b * output_batch_size,
-          output_shape.Dims(2), output_shape.Dims(1), params->stride_width,
-          params->stride_height, params->filter_width, params->filter_height,
-          data->padding.width, data->padding.height, data->activation_min,
-          data->activation_max, depth);
-    }
-    return;
-  }
 
   reference_integer_ops::MaxPool(op_params,
                                  tflite::micro::GetTensorShape(input),

@@ -149,10 +149,30 @@ void ResolveAxis(const int* axis_data, int axis_count,
   op_params->axis_count = axis_count;
 }
 
+// The reference kernel EvalMean uses for a 4D int8 MEAN over axes 1 and 2, whose
+// rounding MeanOverHeightAndWidthInt8 then reproduces.
+enum class MeanKernel {
+  kIntegerMean,         // reference_integer_ops::Mean, for keep_dims
+  kMean,                // reference_ops::Mean, for equal input/output quantization
+  kQuantizedMeanOrSum,  // reference_ops::QuantizedMeanOrSum, otherwise
+};
+
+// Whether MeanOverHeightAndWidthInt8 can take a 4D MEAN over axes 1 and 2: the
+// input is not empty and the output holds one value per batch and channel, the
+// size of the scratch buffer the sums go into.
+bool CanMeanOverHeightAndWidth(const TfLiteEvalTensor* input,
+                               const TfLiteEvalTensor* output) {
+  const RuntimeShape input_shape = tflite::micro::GetTensorShape(input);
+  return input_shape.FlatSize() > 0 &&
+         tflite::micro::GetTensorShape(output).FlatSize() ==
+             input_shape.Dims(0) * input_shape.Dims(3);
+}
+
 // Sums every channel of a [batches, height, width, depth] int8 tensor over height
-// and width, reading the input in memory order. The reference kernels walk it one
-// channel at a time, a stride of `depth` bytes, which misses the cache on almost
-// every read of a tensor in PSRAM.
+// and width in one pass in memory order. reference_integer_ops::Mean walks the
+// input one channel at a time, a stride of `depth` bytes that misses the cache on
+// almost every read of a tensor in PSRAM; the generic reference kernels read it
+// in order but compute a multi-dimensional index for every element.
 void SumOverHeightAndWidth(const RuntimeShape& input_shape,
                            const int8_t* input_data, int32_t* sums) {
   const int batches = input_shape.Dims(0);
@@ -167,9 +187,9 @@ void SumOverHeightAndWidth(const RuntimeShape& input_shape,
   }
 }
 
-// MEAN over axes 1 and 2 of a 4D int8 tensor from the sums above, rounded exactly
-// as reference_integer_ops::Mean (keep_dims) or QuantizedMeanOrSum would.
-void MeanOverHeightAndWidthInt8(const OpData* op_data, bool keep_dims,
+// MEAN over axes 1 and 2 of a 4D int8 tensor from the sums above, rounded
+// exactly as `kernel` rounds it.
+void MeanOverHeightAndWidthInt8(const OpData* op_data, MeanKernel kernel,
                                 const TfLiteEvalTensor* input,
                                 TfLiteEvalTensor* output, int32_t* sums) {
   const RuntimeShape input_shape = tflite::micro::GetTensorShape(input);
@@ -182,7 +202,7 @@ void MeanOverHeightAndWidthInt8(const OpData* op_data, bool keep_dims,
   SumOverHeightAndWidth(input_shape,
                         tflite::micro::GetTensorData<int8_t>(input), sums);
 
-  if (keep_dims) {
+  if (kernel == MeanKernel::kIntegerMean) {
     for (int i = 0; i < count; ++i) {
       int32_t acc = sums[i] - num_elements_in_axis * op_data->input_zp;
       acc = MultiplyByQuantizedMultiplier(acc, op_data->multiplier,
@@ -192,6 +212,10 @@ void MeanOverHeightAndWidthInt8(const OpData* op_data, bool keep_dims,
       acc += op_data->output_zp;
       acc = std::min(std::max(acc, kMinInt8), kMaxInt8);
       output_data[i] = static_cast<int8_t>(acc);
+    }
+  } else if (kernel == MeanKernel::kMean) {
+    for (int i = 0; i < count; ++i) {
+      output_data[i] = static_cast<int8_t>(sums[i] / num_elements_in_axis);
     }
   } else {
     const float scale = op_data->input_scale / op_data->output_scale;
@@ -250,34 +274,46 @@ TfLiteStatus EvalMean(TfLiteContext* context, TfLiteNode* node) {
       }
     } break;
     case kTfLiteInt8: {
-      // Same branches as the reference: 4D Mean across axes 1 & 2 goes through
-      // MeanOverHeightAndWidthInt8 where it would use reference_integer_ops::Mean
-      // (keep_dims) or QuantizedMeanOrSum (otherwise), with the same results.
+      int32_t* temp_buffer = static_cast<int32_t*>(
+          context->GetScratchBuffer(context, op_data->temp_buffer_idx));
+      // A 4D Mean across axes 1 & 2 goes through MeanOverHeightAndWidthInt8,
+      // rounded as the reference kernel of the same branch would round it.
+      const bool sum_in_memory_order =
+          special_case_4d_axes_1_and_2 &&
+          CanMeanOverHeightAndWidth(input, output);
       if (params->keep_dims && special_case_4d_axes_1_and_2) {
-        MeanOverHeightAndWidthInt8(
-            op_data, /*keep_dims=*/true, input, output,
-            static_cast<int32_t*>(
-                context->GetScratchBuffer(context, op_data->temp_buffer_idx)));
+        if (sum_in_memory_order) {
+          MeanOverHeightAndWidthInt8(op_data, MeanKernel::kIntegerMean, input,
+                                     output, temp_buffer);
+        } else {
+          reference_integer_ops::Mean(
+              op_params, op_data->multiplier, op_data->shift,
+              tflite::micro::GetTensorShape(input),
+              tflite::micro::GetTensorData<int8_t>(input), op_data->input_zp,
+              tflite::micro::GetTensorShape(output),
+              tflite::micro::GetTensorData<int8_t>(output),
+              op_data->output_zp);
+        }
       } else if (op_data->input_zp == op_data->output_zp &&
                  op_data->input_scale == op_data->output_scale) {
-        int32_t* temp_buffer = static_cast<int32_t*>(
-            context->GetScratchBuffer(context, op_data->temp_buffer_idx));
-        TF_LITE_ENSURE(
-            context,
-            reference_ops::Mean(
-                tflite::micro::GetTensorData<int8_t>(input), input->dims->data,
-                input->dims->size, tflite::micro::GetTensorData<int8_t>(output),
-                output->dims->data, output->dims->size,
-                tflite::micro::GetTensorData<int>(axis), num_axis,
-                params->keep_dims, temp_index, resolved_axis, temp_buffer));
-      } else if (special_case_4d_axes_1_and_2) {
-        MeanOverHeightAndWidthInt8(
-            op_data, /*keep_dims=*/false, input, output,
-            static_cast<int32_t*>(
-                context->GetScratchBuffer(context, op_data->temp_buffer_idx)));
+        if (sum_in_memory_order) {
+          MeanOverHeightAndWidthInt8(op_data, MeanKernel::kMean, input, output,
+                                     temp_buffer);
+        } else {
+          TF_LITE_ENSURE(
+              context,
+              reference_ops::Mean(
+                  tflite::micro::GetTensorData<int8_t>(input),
+                  input->dims->data, input->dims->size,
+                  tflite::micro::GetTensorData<int8_t>(output),
+                  output->dims->data, output->dims->size,
+                  tflite::micro::GetTensorData<int>(axis), num_axis,
+                  params->keep_dims, temp_index, resolved_axis, temp_buffer));
+        }
+      } else if (sum_in_memory_order) {
+        MeanOverHeightAndWidthInt8(op_data, MeanKernel::kQuantizedMeanOrSum,
+                                   input, output, temp_buffer);
       } else {
-        int32_t* temp_buffer = static_cast<int32_t*>(
-            context->GetScratchBuffer(context, op_data->temp_buffer_idx));
         TF_LITE_ENSURE(
             context,
             reference_ops::QuantizedMeanOrSum(

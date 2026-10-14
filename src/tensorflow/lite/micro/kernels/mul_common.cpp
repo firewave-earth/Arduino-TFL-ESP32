@@ -23,63 +23,12 @@ limitations under the License.
 #include "tensorflow/lite/micro/kernels/kernel_util.h"
 #include "tensorflow/lite/micro/kernels/mul.h"
 #include "tensorflow/lite/micro/memory_helpers.h"
-#include "esp_nn.h"
 
 namespace tflite {
 
 const int kMulInput1Tensor = 0;
 const int kMulInput2Tensor = 1;
 const int kMulOutputTensor = 0;
-
-namespace {
-
-// True when `small` holds one value per channel of `big`: its only dimension
-// above 1, if any, is its last and equals big's last. MUL then broadcasts it over
-// all of big's other dimensions, the SE-scale pattern [1,H,W,C] * [1,1,1,C].
-bool IsPerChannelOf(const RuntimeShape& big, const RuntimeShape& small) {
-  if (big.DimensionsCount() == 0) return false;
-  const int channels = big.Dims(big.DimensionsCount() - 1);
-  if (small.FlatSize() != channels) return false;
-  for (int i = 0; i + 1 < small.DimensionsCount(); ++i) {
-    if (small.Dims(i) != 1) return false;
-  }
-  return true;
-}
-
-// Per-channel broadcast int8 MUL on esp-nn, which computes the same products and
-// requantisation as BroadcastMul4DSlow without its 4D index arithmetic per element.
-// Returns false, doing nothing, when neither input is per-channel of the other.
-bool EvalMulBroadcastChannelInt8(const ArithmeticParams& op_params,
-                                 const TfLiteEvalTensor* input1,
-                                 const TfLiteEvalTensor* input2,
-                                 TfLiteEvalTensor* output) {
-  const RuntimeShape shape1 = tflite::micro::GetTensorShape(input1);
-  const RuntimeShape shape2 = tflite::micro::GetTensorShape(input2);
-  const RuntimeShape output_shape = tflite::micro::GetTensorShape(output);
-
-  const bool input2_per_channel = IsPerChannelOf(shape1, shape2);
-  if (!input2_per_channel && !IsPerChannelOf(shape2, shape1)) return false;
-
-  const TfLiteEvalTensor* big = input2_per_channel ? input1 : input2;
-  const TfLiteEvalTensor* small = input2_per_channel ? input2 : input1;
-  const RuntimeShape& big_shape = input2_per_channel ? shape1 : shape2;
-  if (output_shape.FlatSize() != big_shape.FlatSize()) return false;
-
-  const int channels = big_shape.Dims(big_shape.DimensionsCount() - 1);
-  if (channels == 0) return false;
-  esp_nn_mul_broadcast_channel_s8(
-      tflite::micro::GetTensorData<int8_t>(big),
-      tflite::micro::GetTensorData<int8_t>(small),
-      input2_per_channel ? op_params.input1_offset : op_params.input2_offset,
-      input2_per_channel ? op_params.input2_offset : op_params.input1_offset,
-      tflite::micro::GetTensorData<int8_t>(output), op_params.output_offset,
-      op_params.output_multiplier, op_params.output_shift,
-      op_params.quantized_activation_min, op_params.quantized_activation_max,
-      big_shape.FlatSize() / channels, channels);
-  return true;
-}
-
-}  // namespace
 
 void* MulInit(TfLiteContext* context, const char* buffer, size_t length) {
   TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
@@ -164,10 +113,6 @@ void EvalMulQuantizedReference(TfLiteContext* context, TfLiteNode* node,
       tflite::micro::GetTensorShape(input2), &op_params);
 
   if (input1->type == kTfLiteInt8) {
-    if (need_broadcast &&
-        EvalMulBroadcastChannelInt8(op_params, input1, input2, output)) {
-      return;
-    }
     if (need_broadcast) {
       reference_integer_ops::BroadcastMul4DSlow(
           op_params, tflite::micro::GetTensorShape(input1),
