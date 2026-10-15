@@ -32,6 +32,103 @@ limitations under the License.
 namespace tflite {
 namespace {
 
+// The single-channel kernel below is plain C, and the library builds with -Os,
+// which would keep it from inlining the requantisation or unrolling the taps.
+#pragma GCC push_options
+#pragma GCC optimize("O3")
+
+// Filters with more taps than this keep the esp-nn path.
+constexpr int kMaxSingleChannelTaps = 25;
+
+// MultiplyByQuantizedMultiplier written out so it inlines.
+// SaturatingRoundingDoublingHighMul's sign-dependent nudge and truncating
+// division equal a constant nudge and a floor shift by 31, and it cannot
+// saturate because the multiplier is never INT32_MIN. The rounding shift is
+// RoundingDivideByPOT's own 32-bit form: a variable 64-bit shift would be a
+// libgcc call on Xtensa.
+inline int32_t RequantizeChannel(int32_t x, int32_t multiplier, int shift) {
+  const int left_shift = shift > 0 ? shift : 0;
+  const int right_shift = shift > 0 ? 0 : -shift;
+  const int64_t product = static_cast<int64_t>(x * (1 << left_shift)) * multiplier;
+  const int32_t high = static_cast<int32_t>((product + (int64_t{1} << 30)) >> 31);
+  const int32_t mask = static_cast<int32_t>((uint32_t{1} << right_shift) - 1);
+  const int32_t remainder = high & mask;
+  const int32_t threshold = (mask >> 1) + (high < 0);
+  return (high >> right_shift) + (remainder > threshold);
+}
+
+// int8 CONV_2D with one input channel, such as the PaSST student's stem (3x3,
+// 128x400x1 to 48 channels). esp-nn pads each 3-byte filter row to 16 SIMD lanes
+// there, so most lanes multiply zeros; this gathers each pixel's window once and
+// reuses it for every output channel. Same arithmetic as
+// reference_integer_ops::ConvPerChannel: taps outside the image contribute
+// nothing, then bias, requantisation, offset and clamp in the same order.
+// kTaps is the filter's tap count when known at compile time, 0 otherwise.
+template <int kTaps>
+void ConvSingleInputChannelInt8(const ConvParams& params,
+                                const int32_t* output_multiplier,
+                                const int32_t* output_shift,
+                                const RuntimeShape& input_shape,
+                                const int8_t* input_data,
+                                const RuntimeShape& filter_shape,
+                                const int8_t* filter_data,
+                                const int32_t* bias_data,
+                                const RuntimeShape& output_shape,
+                                int8_t* output_data) {
+  const int batches = MatchingDim(input_shape, 0, output_shape, 0);
+  const int input_height = input_shape.Dims(1);
+  const int input_width = input_shape.Dims(2);
+  const int filter_height = filter_shape.Dims(1);
+  const int filter_width = filter_shape.Dims(2);
+  const int taps = kTaps > 0 ? kTaps : filter_height * filter_width;
+  const int output_height = output_shape.Dims(1);
+  const int output_width = output_shape.Dims(2);
+  const int output_depth = MatchingDim(filter_shape, 0, output_shape, 3);
+
+  int32_t window[kMaxSingleChannelTaps];
+  int8_t* out = output_data;
+  for (int batch = 0; batch < batches; ++batch) {
+    const int8_t* image = input_data + batch * input_height * input_width;
+    for (int out_y = 0; out_y < output_height; ++out_y) {
+      const int in_y_origin =
+          out_y * params.stride_height - params.padding_values.height;
+      for (int out_x = 0; out_x < output_width; ++out_x) {
+        const int in_x_origin =
+            out_x * params.stride_width - params.padding_values.width;
+        // Input plus offset at every tap, 0 where the tap is outside the image.
+        int k = 0;
+        for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
+          const int in_y = in_y_origin + params.dilation_height_factor * filter_y;
+          for (int filter_x = 0; filter_x < filter_width; ++filter_x, ++k) {
+            const int in_x =
+                in_x_origin + params.dilation_width_factor * filter_x;
+            const bool inside = in_x >= 0 && in_x < input_width && in_y >= 0 &&
+                                in_y < input_height;
+            window[k] =
+                inside ? image[in_y * input_width + in_x] + params.input_offset
+                       : 0;
+          }
+        }
+        const int8_t* filter = filter_data;
+        for (int out_channel = 0; out_channel < output_depth; ++out_channel) {
+          int32_t acc = 0;
+          for (int t = 0; t < taps; ++t) acc += filter[t] * window[t];
+          filter += taps;
+          if (bias_data) acc += bias_data[out_channel];
+          acc = RequantizeChannel(acc, output_multiplier[out_channel],
+                                  output_shift[out_channel]);
+          acc += params.output_offset;
+          acc = std::max(acc, params.quantized_activation_min);
+          acc = std::min(acc, params.quantized_activation_max);
+          *out++ = static_cast<int8_t>(acc);
+        }
+      }
+    }
+  }
+}
+
+#pragma GCC pop_options
+
 void* Init(TfLiteContext* context, const char* buffer, size_t length) {
   TFLITE_DCHECK(context->AllocatePersistentBuffer != nullptr);
   return context->AllocatePersistentBuffer(context, sizeof(OpDataConv));
@@ -118,6 +215,20 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
       const auto& filter_shape = tflite::micro::GetTensorShape(filter);
       const auto& output_shape = tflite::micro::GetTensorShape(output);
       const auto conv_params = ConvParamsQuantized(params, data);
+
+      const int taps = filter_shape.Dims(1) * filter_shape.Dims(2);
+      if (input_shape.Dims(3) == 1 && filter_shape.Dims(3) == 1 &&
+          taps <= kMaxSingleChannelTaps) {
+        auto* conv = taps == 9 ? ConvSingleInputChannelInt8<9>
+                               : ConvSingleInputChannelInt8<0>;
+        conv(conv_params, data.per_channel_output_multiplier,
+             data.per_channel_output_shift, input_shape,
+             tflite::micro::GetTensorData<int8_t>(input), filter_shape,
+             tflite::micro::GetTensorData<int8_t>(filter),
+             tflite::micro::GetOptionalTensorData<int32_t>(bias), output_shape,
+             tflite::micro::GetTensorData<int8_t>(output));
+        break;
+      }
 
       data_dims_t input_dims = {input_shape.Dims(2), input_shape.Dims(1),
                                 input_shape.Dims(3), 0};
