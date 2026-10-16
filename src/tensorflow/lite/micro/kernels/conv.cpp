@@ -29,6 +29,8 @@ limitations under the License.
 #include "esp_nn.h"
 #include <esp_heap_caps.h>
 
+#include <cstring>
+
 namespace tflite {
 namespace {
 
@@ -127,6 +129,125 @@ void ConvSingleInputChannelInt8(const ConvParams& params,
   }
 }
 
+#if defined(ARCH_ESP32_S3)
+// One esp-nn window: the input under each tap, so up to 16 taps.
+constexpr int kWindowBytes = 16;
+// Output pixels per esp_nn_conv_s8_window16 call: the windows stay small in
+// internal RAM, and the strided bytes each call writes stay in the data cache
+// until the other channels fill in their lines.
+constexpr int kWindowPixels = 128;
+
+// The same convolution as ConvSingleInputChannelInt8 on the S3's SIMD unit: each
+// pixel's taps are gathered into a 16-byte window, then esp-nn takes one output
+// channel at a time across the row, one vector multiply-accumulate per output.
+// Returns false, having written nothing, when esp-nn cannot reproduce the
+// reference exactly for these quantisation parameters or the scratch buffer
+// cannot be allocated.
+bool ConvSingleInputChannelWindow16(const ConvParams& params,
+                                    const int32_t* output_multiplier,
+                                    const int32_t* output_shift,
+                                    const RuntimeShape& input_shape,
+                                    const int8_t* input_data,
+                                    const RuntimeShape& filter_shape,
+                                    const int8_t* filter_data,
+                                    const int32_t* bias_data,
+                                    const RuntimeShape& output_shape,
+                                    int8_t* output_data) {
+  const int batches = MatchingDim(input_shape, 0, output_shape, 0);
+  const int input_height = input_shape.Dims(1);
+  const int input_width = input_shape.Dims(2);
+  const int filter_height = filter_shape.Dims(1);
+  const int filter_width = filter_shape.Dims(2);
+  const int taps = filter_height * filter_width;
+  const int output_height = output_shape.Dims(1);
+  const int output_width = output_shape.Dims(2);
+  const int output_depth = MatchingDim(filter_shape, 0, output_shape, 3);
+  // Taps outside the image read the input zero point, so they add nothing once
+  // the input offset is applied.
+  const int32_t fill = -params.input_offset;
+  if (taps > kWindowBytes || fill < -128 || fill > 127) return false;
+
+  // One window past the last pixel: the kernel loads ahead.
+  const size_t window_bytes = (kWindowPixels + 1) * kWindowBytes;
+  const size_t filter_bytes = output_depth * kWindowBytes;
+  const size_t quant_bytes = output_depth * sizeof(conv_window16_quant_t);
+  auto* scratch = static_cast<int8_t*>(heap_caps_aligned_alloc(
+      16, window_bytes + filter_bytes + quant_bytes,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (!scratch) return false;
+  int8_t* windows = scratch;
+  int8_t* filters = scratch + window_bytes;
+  auto* quant = reinterpret_cast<conv_window16_quant_t*>(filters + filter_bytes);
+
+  // Lanes past the last tap stay 0; the filters are 0 there too.
+  memset(scratch, 0, window_bytes + filter_bytes);
+  for (int c = 0; c < output_depth; ++c) {
+    int8_t* filter = filters + c * kWindowBytes;
+    memcpy(filter, filter_data + c * taps, taps);
+    if (esp_nn_conv_s8_window16_quant_init(
+            filter, bias_data ? bias_data[c] : 0, params.input_offset,
+            params.output_offset, output_multiplier[c], output_shift[c],
+            params.quantized_activation_min, params.quantized_activation_max,
+            &quant[c]) != 0) {
+      heap_caps_free(scratch);
+      return false;
+    }
+  }
+
+  for (int batch = 0; batch < batches; ++batch) {
+    const int8_t* image = input_data + batch * input_height * input_width;
+    for (int out_y = 0; out_y < output_height; ++out_y) {
+      const int in_y_origin =
+          out_y * params.stride_height - params.padding_values.height;
+      int8_t* out_row =
+          output_data +
+          ((batch * output_height + out_y) * output_width) * output_depth;
+      for (int x0 = 0; x0 < output_width; x0 += kWindowPixels) {
+        const int n = std::min(kWindowPixels, output_width - x0);
+        for (int filter_y = 0; filter_y < filter_height; ++filter_y) {
+          const int in_y = in_y_origin + params.dilation_height_factor * filter_y;
+          const int8_t* row = in_y >= 0 && in_y < input_height
+                                  ? image + in_y * input_width
+                                  : nullptr;
+          for (int filter_x = 0; filter_x < filter_width; ++filter_x) {
+            int8_t* lane = windows + filter_y * filter_width + filter_x;
+            // Pixel i reads row[(x0 + i) * stride + offset]; [first, last)
+            // are the pixels where that is inside the image.
+            const int offset = params.dilation_width_factor * filter_x -
+                               params.padding_values.width;
+            int first = 0, last = row ? n : 0;
+            while (first < last &&
+                   (x0 + first) * params.stride_width + offset < 0) {
+              ++first;
+            }
+            while (last > first &&
+                   (x0 + last - 1) * params.stride_width + offset >=
+                       input_width) {
+              --last;
+            }
+            for (int i = 0; i < first; ++i) lane[i * kWindowBytes] = fill;
+            if (first < last) {
+              const int8_t* in = row + (x0 + first) * params.stride_width + offset;
+              for (int i = first; i < last; ++i, in += params.stride_width) {
+                lane[i * kWindowBytes] = *in;
+              }
+            }
+            for (int i = last; i < n; ++i) lane[i * kWindowBytes] = fill;
+          }
+        }
+        int8_t* out = out_row + x0 * output_depth;
+        for (int c = 0; c < output_depth; ++c) {
+          esp_nn_conv_s8_window16(windows, filters + c * kWindowBytes, out + c, n,
+                                  output_depth, &quant[c]);
+        }
+      }
+    }
+  }
+  heap_caps_free(scratch);
+  return true;
+}
+#endif  // ARCH_ESP32_S3
+
 #pragma GCC pop_options
 
 void* Init(TfLiteContext* context, const char* buffer, size_t length) {
@@ -219,6 +340,17 @@ TfLiteStatus Eval(TfLiteContext* context, TfLiteNode* node) {
       const int taps = filter_shape.Dims(1) * filter_shape.Dims(2);
       if (input_shape.Dims(3) == 1 && filter_shape.Dims(3) == 1 &&
           taps <= kMaxSingleChannelTaps) {
+#if defined(ARCH_ESP32_S3)
+        if (ConvSingleInputChannelWindow16(
+                conv_params, data.per_channel_output_multiplier,
+                data.per_channel_output_shift, input_shape,
+                tflite::micro::GetTensorData<int8_t>(input), filter_shape,
+                tflite::micro::GetTensorData<int8_t>(filter),
+                tflite::micro::GetOptionalTensorData<int32_t>(bias),
+                output_shape, tflite::micro::GetTensorData<int8_t>(output))) {
+          break;
+        }
+#endif
         auto* conv = taps == 9 ? ConvSingleInputChannelInt8<9>
                                : ConvSingleInputChannelInt8<0>;
         conv(conv_params, data.per_channel_output_multiplier,
